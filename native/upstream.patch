@@ -1,0 +1,125 @@
+--- a/qwen_asr.c
++++ b/qwen_asr.c
+@@ -13,6 +13,7 @@
+ #include "qwen_asr_cuda.h"
+ #endif
+ #include "qwen_asr_kernels.h"
++#include "vime_ar_weights.h"
+ #include "qwen_asr_safetensors.h"
+ #include "qwen_asr_audio.h"
+ #include "qwen_asr_tokenizer.h"
+@@ -250,6 +251,8 @@
+ #endif
+     ctx->search_sec = 3.0f;
+ 
++    if (vime_ar_init(ctx) != 0) { qwen_free(ctx); return NULL; }
++
+     /* Default streaming parameters */
+     ctx->stream_chunk_sec = 2.0f;
+     ctx->stream_rollback = 5;
+@@ -276,6 +279,8 @@
+ #endif
+ 
+     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
++
++    vime_ar_free();
+ 
+     /* Encoder conv stem */
+     FREE0(ctx->encoder.conv1_weight); FREE0(ctx->encoder.conv1_bias);
+--- a/qwen_asr_kernels.c
++++ b/qwen_asr_kernels.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "qwen_asr_kernels.h"
++#include "vime_ar_weights.h"
+ #include "qwen_asr_kernels_impl.h"
+ #include <math.h>
+ #include <string.h>
+@@ -335,6 +336,7 @@
+  */
+ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W_bf16,
+                                const float *bias, int in_dim, int out_dim) {
++    if (vime_ar_matvec(y, x, W_bf16, bias, in_dim, out_dim)) return;
+     qwen_bf16_matvec_fused_impl(y, x, W_bf16, bias, in_dim, out_dim);
+ }
+ 
+@@ -488,6 +490,7 @@
+ static void argmax_bf16_range(const float *x, const uint16_t *W_bf16,
+                                int in_dim, int start, int end,
+                                int *best_out, float *best_val_out) {
++    if (vime_ar_argmax(x, W_bf16, in_dim, start, end, best_out, best_val_out)) return;
+     qwen_argmax_bf16_range_impl(x, W_bf16, in_dim, start, end, best_out, best_val_out);
+ }
+ 
+--- a/qwen_asr.c
++++ b/qwen_asr.c
+@@ -1241,6 +1241,8 @@
+     int rollback = ctx->stream_rollback;
+     int unfixed_chunks = ctx->stream_unfixed_chunks;
+     int max_new_tokens = ctx->stream_max_new_tokens > 0 ? ctx->stream_max_new_tokens : 32;
++    const char *coalesce_env = getenv("QWEN_STREAM_EOF_COALESCE");
++    int coalesce_eof = coalesce_env && atoi(coalesce_env) != 0;
+ 
+     const float *audio_samples = samples;
+     int64_t audio_n_samples = n_samples;
+@@ -1520,7 +1522,22 @@
+         }
+ 
+         double chunk_t0 = get_time_ms();
+-        audio_cursor += chunk_samples;
++        int step_max_new_tokens = max_new_tokens;
++        int64_t pending_samples = audio_n_samples - audio_cursor;
++        if (live && live_eof && coalesce_eof && n_stable_text_tokens > 0 &&
++            pending_samples > chunk_samples) {
++            /* Keep new audio inside the decoder context and retain old overlap.
++             * Cold-start steps must first establish a committed text prefix. */
++            int64_t advance = pending_samples;
++            int64_t limit = 2LL * enc_window_samples;
++            if (advance > limit) advance = limit;
++            int64_t steps = (advance + chunk_samples - 1) / chunk_samples;
++            int64_t budget = steps * max_new_tokens;
++            step_max_new_tokens = budget > 512 ? 512 : (int)budget;
++            audio_cursor += advance;
++        } else {
++            audio_cursor += chunk_samples;
++        }
+         if (audio_cursor > audio_n_samples) audio_cursor = audio_n_samples;
+         int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)
+                             : (audio_cursor >= audio_n_samples);
+@@ -1832,7 +1849,7 @@
+         int n_generated = 0;
+ 
+         /* Collect ALL generated tokens (including language, <asr_text>, etc.) */
+-        int *chunk_tokens = (int *)malloc((size_t)max_new_tokens * sizeof(int));
++        int *chunk_tokens = (int *)malloc((size_t)step_max_new_tokens * sizeof(int));
+         if (!chunk_tokens) {
+             ctx->perf_total_ms += get_time_ms() - chunk_t0;
+             chunk_idx++;
+@@ -1840,7 +1857,7 @@
+         }
+         int n_chunk_tokens = 0;
+ 
+-        while (n_generated < max_new_tokens) {
++        while (n_generated < step_max_new_tokens) {
+             n_generated++;
+             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
+ 
+@@ -1856,7 +1873,7 @@
+             fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s)\n",
+                     n_generated, decode_ms,
+                     n_generated > 0 ? decode_ms / n_generated : 0,
+-                    (n_generated >= max_new_tokens &&
++                    (n_generated >= step_max_new_tokens &&
+                      token != QWEN_TOKEN_ENDOFTEXT &&
+                      token != QWEN_TOKEN_IM_END) ? ", hit max_new" : "");
+         if (qwen_monitor) {
+@@ -1971,7 +1988,7 @@
+                                                       QWEN_STREAM_DEGEN_MAX_PERIOD,
+                                                       &tail_period);
+             int candidate_advance = candidate_len - n_stable_text_tokens;
+-            if (!is_final && n_generated >= max_new_tokens && candidate_advance <= 1) {
++            if (!is_final && n_generated >= step_max_new_tokens && candidate_advance <= 1) {
+                 stagnant_chunks++;
+             } else {
+                 stagnant_chunks = 0;
